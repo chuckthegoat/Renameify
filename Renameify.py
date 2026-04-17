@@ -1,6 +1,7 @@
 import sys
 import os
 import requests
+import re
 from guessit import guessit
 from dotenv import load_dotenv
 
@@ -16,14 +17,52 @@ from PyQt6.QtCore import QRunnable, QThreadPool, pyqtSignal, QObject, QTimer
 import time
 
 # =========================================================
+# HELPER FUNCTIONS
+# =========================================================
+
+def get_base_path():
+    """
+    Returns correct base path whether running:
+    - normally (python script)
+    - or bundled exe (PyInstaller)
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(__file__)
+
+def sanitize_filename(name):
+    """
+    Removes illegal/special characters and normalizes spacing.
+    Keeps it Plex-friendly and filesystem-safe.
+    """
+
+    # Replace common separators with space
+    name = name.replace(".", " ").replace("_", " ")
+
+    # Remove illegal filesystem characters
+    name = re.sub(r'[<>:"/\\|?*]', '', name)
+
+    # Remove any remaining non-alphanumeric (except spaces and parentheses)
+    name = re.sub(r'[^a-zA-Z0-9()\-\s]', '', name)
+
+    # Collapse multiple spaces into one
+    name = re.sub(r'\s+', ' ', name)
+
+    return name.strip()
+
+# =========================================================
 # ENVIRONMENT + CONFIGURATION
 # =========================================================
 
-# Load environment variables from .env file (TMDB API key)
-load_dotenv()
+BASE_DIR = get_base_path()
+
+# Load .env explicitly from correct location
+dotenv_path = os.path.join(BASE_DIR, ".env")
+load_dotenv(dotenv_path)
+
+API_KEY = os.getenv("TMDB_API_KEY")
 
 # TMDB API configuration constants
-API_KEY = os.getenv("TMDB_API_KEY")
 BASE_URL = "https://api.themoviedb.org/3"
 IMAGE_BASE = "https://image.tmdb.org/t/p/w300"
 
@@ -71,8 +110,8 @@ class TMDBWorker(QRunnable):
             # Return only top 3 results for UI simplicity
             results = r.json().get("results", [])[:3]
 
-        except:
-            # Fail silently to avoid breaking UI flow
+        except Exception as e:
+            print("Error querying TMDB:", e)
             results = []
 
         # send results back to UI thread
@@ -108,7 +147,11 @@ class MovieRow(QWidget):
         self.base, self.ext = os.path.splitext(filename)
 
         # Use guessit to extract metadata (title/year) from filename
-        info = guessit(filename)
+        try:
+            info = guessit(filename)
+        except Exception as e:
+            print("Guessit failed:", e)
+            info = {}
         title = info.get("title")
         year = info.get("year")
 
@@ -270,7 +313,8 @@ class MovieRow(QWidget):
         # Build Plex-style filename preview
         title = movie.get("title", "Unknown")
         year = (movie.get("release_date") or "")[:4] or "Unknown"
-        self.preview.setText(f"{title} ({year}){self.ext}")
+        clean_title = sanitize_filename(title)
+        self.preview.setText(f"{clean_title} ({year}){self.ext}")
 
         # Load poster image if available
         if movie.get("poster_path"):
@@ -301,7 +345,8 @@ class MovieRow(QWidget):
         title = movie.get("title", "Unknown")
         year = (movie.get("release_date") or "")[:4] or "Unknown"
 
-        new_name = f"{title} ({year}){self.ext}"
+        clean_title = sanitize_filename(title)
+        new_name = f"{clean_title} ({year}){self.ext}"
         new_path = os.path.join(os.path.dirname(self.filepath), new_name)
 
         os.rename(self.filepath, new_path)
@@ -364,12 +409,20 @@ class MovieRenamer(QWidget):
         if e.mimeData().hasUrls():
             e.accept()
 
-    def dropEvent(self, e):
-        # Convert dropped URLs into file paths
-        for url in e.mimeData().urls():
-            path = url.toLocalFile()
-            if os.path.isfile(path):
+    def dropEvent(self, event):
+        try:
+            for url in event.mimeData().urls():
+                path = url.toLocalFile()
+
+                if not os.path.isfile(path):
+                    continue
+
+                print("Dropped:", path)
+
                 self.add_file(path)
+
+        except Exception as e:
+            print("DROP ERROR:", e)
 
     # =========================================================
     # ROW MANAGEMENT
@@ -386,10 +439,13 @@ class MovieRenamer(QWidget):
             self.empty_label.hide()
 
     def add_file(self, path):
-        row = MovieRow(path, self.remove_row)
-        self.rows.append(row)
-        self.list_layout.addWidget(row)
-        self.update_empty_state()
+        try:
+            row = MovieRow(path, self.remove_row)
+            self.rows.append(row)
+            self.list_layout.addWidget(row)
+            self.update_empty_state()
+        except Exception as e:
+            print("ADD FILE ERROR:", e)
 
     def remove_row(self, row):
         self.rows.remove(row)
@@ -397,13 +453,61 @@ class MovieRenamer(QWidget):
         row.deleteLater()
         self.update_empty_state()
 
+    def clear_all_rows(self):
+        """
+        Removes all movie rows from UI and resets internal state.
+        """
+
+        # Remove widgets safely
+        for row in self.rows:
+            self.list_layout.removeWidget(row)
+            row.setParent(None)
+            row.deleteLater()
+
+        # Reset internal tracking list
+        self.rows.clear()
+
+        self.update_empty_state()
+
     # =========================================================
     # BATCH RENAME ACTION
     # =========================================================
 
     def rename_all(self):
+        if not self.rows:
+            return
+
+        # ---------------------------
+        # CONFIRM RENAME ACTION
+        # ---------------------------
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Rename",
+            "Rename all files?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        # ---------------------------
+        # EXECUTE RENAME
+        # ---------------------------
         for r in self.rows:
             r.rename()
+
+        # ---------------------------
+        # COMPLETION POPUP WITH CLEAR OPTION
+        # ---------------------------
+        clear_confirm = QMessageBox.question(
+            self,
+            "Rename Complete",
+            "All files have been renamed.\n\nClear list?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if clear_confirm == QMessageBox.StandardButton.Yes:
+            self.clear_all_rows()
 
 
 # =========================================================
