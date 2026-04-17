@@ -324,6 +324,17 @@ class MovieRenamer(QWidget):
         # Main vertical layout for entire window
         layout = QVBoxLayout(self)
 
+        # Empty-state label
+        self.empty_label = QLabel("Drag and drop movie files")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setStyleSheet("""
+            color: #555;
+            font-size: 18px;
+            font-weight: 500;
+        """)
+        self.empty_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(self.empty_label)
+
         # Scrollable container for movie rows
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -342,6 +353,8 @@ class MovieRenamer(QWidget):
 
         # Enable drag-and-drop file support
         self.setAcceptDrops(True)
+
+        self.update_empty_state()
 
     # =========================================================
     # DRAG & DROP HANDLING
@@ -362,15 +375,27 @@ class MovieRenamer(QWidget):
     # ROW MANAGEMENT
     # =========================================================
 
+    def update_empty_state(self):
+        """
+        Shows placeholder text when no movies are loaded.
+        Hides it when rows exist.
+        """
+        if len(self.rows) == 0:
+            self.empty_label.show()
+        else:
+            self.empty_label.hide()
+
     def add_file(self, path):
         row = MovieRow(path, self.remove_row)
         self.rows.append(row)
         self.list_layout.addWidget(row)
+        self.update_empty_state()
 
     def remove_row(self, row):
         self.rows.remove(row)
         row.setParent(None)
         row.deleteLater()
+        self.update_empty_state()
 
     # =========================================================
     # BATCH RENAME ACTION
