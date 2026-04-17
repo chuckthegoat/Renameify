@@ -144,7 +144,15 @@ class MovieRow(QWidget):
 
         # Extract filename and extension for rename operations
         filename = os.path.basename(filepath)
-        self.base, self.ext = os.path.splitext(filename)
+
+        # Check if the file given is a directory and handle accordingly
+        self.is_folder = os.path.isdir(filepath)
+
+        if self.is_folder:
+            self.base = filename
+            self.ext = ""  # folders have no extension
+        else:
+            self.base, self.ext = os.path.splitext(filename)
 
         # Use guessit to extract metadata (title/year) from filename
         try:
@@ -221,6 +229,10 @@ class MovieRow(QWidget):
         right.addWidget(orig_label)
 
         self.file_label = QLabel(filename)
+
+        if self.is_folder:
+            self.file_label.setText(f"[Folder] {filename}")
+
         self.file_label.setWordWrap(True)
         self.file_label.setStyleSheet(
             "color: #000; font-weight: 500;"
@@ -314,7 +326,10 @@ class MovieRow(QWidget):
         title = movie.get("title", "Unknown")
         year = (movie.get("release_date") or "")[:4] or "Unknown"
         clean_title = sanitize_filename(title)
-        self.preview.setText(f"{clean_title} ({year}){self.ext}")
+        if self.is_folder:
+            self.preview.setText(f"{clean_title} ({year})")
+        else:
+            self.preview.setText(f"{clean_title} ({year}){self.ext}")
 
         # Load poster image if available
         if movie.get("poster_path"):
@@ -346,7 +361,11 @@ class MovieRow(QWidget):
         year = (movie.get("release_date") or "")[:4] or "Unknown"
 
         clean_title = sanitize_filename(title)
-        new_name = f"{clean_title} ({year}){self.ext}"
+        if self.is_folder:
+            new_name = f"{clean_title} ({year})"
+        else:
+            new_name = f"{clean_title} ({year}){self.ext}"
+
         new_path = os.path.join(os.path.dirname(self.filepath), new_name)
 
         os.rename(self.filepath, new_path)
@@ -414,7 +433,7 @@ class MovieRenamer(QWidget):
             for url in event.mimeData().urls():
                 path = url.toLocalFile()
 
-                if not os.path.isfile(path):
+                if not (os.path.isfile(path) or os.path.isdir(path)):
                     continue
 
                 print("Dropped:", path)
