@@ -7,413 +7,386 @@ from dotenv import load_dotenv
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel,
     QPushButton, QComboBox, QMessageBox,
-    QScrollArea, QFrame, QHBoxLayout, QSizePolicy
+    QScrollArea, QHBoxLayout
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
 
-# ---------------------------
-# LOAD ENV VARIABLES
-# ---------------------------
-# Loads TMDB API key from .env file so it's not hardcoded
+from PyQt6.QtCore import QRunnable, QThreadPool, pyqtSignal, QObject, QTimer
+import time
+
+# =========================================================
+# ENVIRONMENT + CONFIGURATION
+# =========================================================
+
+# Load environment variables from .env file (TMDB API key)
 load_dotenv()
 
+# TMDB API configuration constants
 API_KEY = os.getenv("TMDB_API_KEY")
 BASE_URL = "https://api.themoviedb.org/3"
 IMAGE_BASE = "https://image.tmdb.org/t/p/w300"
 
+# Thread pool definition and API call parameters
+thread_pool = QThreadPool.globalInstance()
+LAST_API_CALL = 0
+MIN_API_INTERVAL = 0.25  # 250ms between TMDB calls
 
-# ---------------------------
-# APPLICATION THEME (DARK MODE)
-# ---------------------------
-# Applies a consistent dark UI theme across all widgets
-def apply_dark_theme(app):
-    app.setStyle("Fusion")
+# =========================================================
+# WORKER THREADS
+# =========================================================
+class WorkerSignals(QObject):
+    result = pyqtSignal(object, list)
 
-    from PyQt6.QtGui import QPalette, QColor
+class TMDBWorker(QRunnable):
+    def __init__(self, title, year, callback):
+        super().__init__()
+        self.title = title
+        self.year = year
+        self.signals = WorkerSignals()
+        self.signals.result.connect(callback)
 
-    palette = QPalette()
-    palette.setColor(QPalette.ColorRole.Window, QColor(30, 30, 30))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor(220, 220, 220))
-    palette.setColor(QPalette.ColorRole.Base, QColor(25, 25, 25))
-    palette.setColor(QPalette.ColorRole.Text, QColor(220, 220, 220))
-    palette.setColor(QPalette.ColorRole.Button, QColor(45, 45, 45))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor(220, 220, 220))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 120, 215))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
-    app.setPalette(palette)
+    def run(self):
+        global LAST_API_CALL
 
+        # ---------------------------
+        # RATE LIMIT TMDB CALLS
+        # ---------------------------
+        now = time.time()
+        wait = MIN_API_INTERVAL - (now - LAST_API_CALL)
+        if wait > 0:
+            time.sleep(wait)
 
-# ---------------------------
-# TMDB API SEARCH FUNCTION
-# ---------------------------
-# Queries TheMovieDB for up to 3 candidate matches
-def search_movies(title, year=None):
-    url = f"{BASE_URL}/search/movie"
-    params = {"api_key": API_KEY, "query": title}
+        LAST_API_CALL = time.time()
 
-    if year:
-        params["year"] = year
+        try:
+            params = {"api_key": API_KEY, "query": self.title}
 
-    try:
-        r = requests.get(url, params=params)
-        return r.json().get("results", [])[:3]
-    except:
-        return []
+            # Add year filter if available from filename parsing
+            if self.year:
+                params["year"] = self.year
 
+            r = requests.get(f"{BASE_URL}/search/movie", params=params, timeout=10)
 
-# ---------------------------
-# FORMAT FINAL FILE NAME
-# ---------------------------
-# Converts selected movie metadata into Plex-style filename
-def format_name(movie, ext):
-    title = movie["title"]
-    year = movie.get("release_date", "")[:4] or "Unknown"
-    return f"{title} ({year}){ext}"
+            # Return only top 3 results for UI simplicity
+            results = r.json().get("results", [])[:3]
 
+        except:
+            # Fail silently to avoid breaking UI flow
+            results = []
 
-# ---------------------------
+        # send results back to UI thread
+        self.signals.result.emit(self, results)
+        
+class PosterWorker(QRunnable):
+    def __init__(self, url, callback):
+        super().__init__()
+        self.url = url
+        self.callback = callback
+
+    def run(self):
+        try:
+            data = requests.get(self.url, timeout=10).content
+            self.callback(data)
+        except:
+            pass
+
+# =========================================================
 # MOVIE ROW UI COMPONENT
-# ---------------------------
-# Represents a single movie entry (poster + metadata + controls)
-class MovieRow(QFrame):
-    def __init__(self, filepath):
+# =========================================================
+
+class MovieRow(QWidget):
+    def __init__(self, filepath, remove_callback):
         super().__init__()
 
-        # Store file reference for renaming operations
+        # Store file reference and callback for deletion
         self.filepath = filepath
-        self.on_remove = None
+        self.remove_callback = remove_callback
 
-        # ---------------------------
-        # ROW STYLING CONTAINER
-        # ---------------------------
-        self.setStyleSheet("""
-            QFrame {
-                background-color: #2a2a2a;
-                border-radius: 10px;
-                padding: 10px;
-            }
-        """)
-
-        # Main horizontal layout: poster (left) + details (right)
-        main = QHBoxLayout()
-        main.setSpacing(15)
-        main.setContentsMargins(10, 10, 10, 10)
-
-        # ---------------------------
-        # LEFT COLUMN: POSTER DISPLAY
-        # ---------------------------
-        self.poster = QLabel()
-        self.poster.setFixedSize(120, 180)
-        self.poster.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.poster.setStyleSheet("background-color: #444; border-radius: 6px;")
-
-        main.addWidget(self.poster)
-
-        # ---------------------------
-        # RIGHT COLUMN: DATA + CONTROLS
-        # ---------------------------
-        right = QVBoxLayout()
-        right.setSpacing(10)
-
-        # ---------------------------
-        # REMOVE BUTTON (TOP RIGHT)
-        # ---------------------------
-        # Small red "x" button for removing row
-        top = QHBoxLayout()
-        top.addStretch()
-
-        self.remove_button = QPushButton("x")
-        self.remove_button.setFixedSize(20, 20)
-        self.remove_button.setStyleSheet("""
-            QPushButton {
-                color: #ff4d4d;
-                background: transparent;
-                border: none;
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                color: #ff1a1a;
-            }
-        """)
-        self.remove_button.clicked.connect(self.handle_remove)
-
-        top.addWidget(self.remove_button)
-        right.addLayout(top)
-
-        # ---------------------------
-        # FILE METADATA PARSING
-        # ---------------------------
-        # Extracts title/year guess from filename using guessit
+        # Extract filename and extension for rename operations
         filename = os.path.basename(filepath)
-        self.name, self.ext = os.path.splitext(filename)
+        self.base, self.ext = os.path.splitext(filename)
 
+        # Use guessit to extract metadata (title/year) from filename
         info = guessit(filename)
         title = info.get("title")
         year = info.get("year")
 
-        # Query TMDB for candidate matches (top 3 results)
-        self.matches = search_movies(title, year) if title else []
+        # Query TMDB only if a title was detected
+        self.matches = []
+
+        if title:
+            worker = TMDBWorker(title, year, self.on_matches_ready)
+            thread_pool.start(worker)
+
+        # =====================================================
+        # UI LAYOUT SETUP
+        # =====================================================
+
+        layout = QHBoxLayout(self)
 
         # ---------------------------
-        # FIELD LAYOUT (TABLE-STYLE ALIGNMENT)
+        # LEFT: POSTER DISPLAY AREA
         # ---------------------------
-        # Each field is a label + value aligned in a fixed row structure
-        field_grid = QVBoxLayout()
-        field_grid.setSpacing(8)
-
-        def make_row(label_text, widget):
-            """
-            Creates a consistent two-column row:
-            LABEL (fixed width) + VALUE (aligned)
-            """
-
-            row = QHBoxLayout()
-            row.setSpacing(10)
-
-            # Label column (fixed width ensures alignment across rows)
-            label = QLabel(label_text)
-            label.setFixedWidth(90)
-            label.setStyleSheet("color: #aaa; font-size: 12px; font-weight: 600;")
-
-            # Value widget (combo box or label)
-            widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-
-            # Align both elements properly
-            row.addWidget(label, alignment=Qt.AlignmentFlag.AlignTop)
-            row.addWidget(widget, alignment=Qt.AlignmentFlag.AlignLeft)
-
-            container = QWidget()
-            container.setLayout(row)
-
-            return container
+        self.poster = QLabel()
+        self.poster.setFixedWidth(120)
+        self.poster.setMinimumHeight(180)
+        self.poster.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.poster)
 
         # ---------------------------
-        # ORIGINAL FILE FIELD
+        # RIGHT: DATA COLUMN
         # ---------------------------
+        right = QVBoxLayout()
+
+        # =====================================================
+        # REMOVE BUTTON (TOP RIGHT OF ROW)
+        # =====================================================
+
+        top_bar = QHBoxLayout()
+        top_bar.addStretch()  # pushes button to far right
+
+        remove_btn = QPushButton("×")
+        remove_btn.setFixedSize(16, 16)
+
+        # Minimal red "x" button styling
+        remove_btn.setStyleSheet("""
+            QPushButton {
+                color: #ff5c5c;
+                background: transparent;
+                border: none;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                color: #ff1f1f;
+            }
+        """)
+
+        # Trigger removal callback passed from parent widget
+        remove_btn.clicked.connect(lambda: self.remove_callback(self))
+
+        top_bar.addWidget(remove_btn)
+        right.addLayout(top_bar)
+
+        # =====================================================
+        # ORIGINAL FILE DISPLAY
+        # =====================================================
+
+        orig_label = QLabel("Original File")
+        orig_label.setStyleSheet("color: #888; font-size: 14px;")
+        right.addWidget(orig_label)
+
         self.file_label = QLabel(filename)
         self.file_label.setWordWrap(True)
+        self.file_label.setStyleSheet(
+            "color: #000; font-weight: 500;"
+        )
+        right.addWidget(self.file_label)
 
-        # ---------------------------
+        # =====================================================
+        # NEW NAME PREVIEW DISPLAY
+        # =====================================================
+
+        preview_label = QLabel("New Name Preview")
+        preview_label.setStyleSheet("color: #888; font-size: 14px;")
+        right.addWidget(preview_label)
+
+        self.preview = QLabel()
+        self.preview.setWordWrap(True)
+        self.preview.setStyleSheet(
+            "color: #000; font-weight: 500;"
+        )
+        right.addWidget(self.preview)
+
+        # =====================================================
         # MATCH SELECTION DROPDOWN
-        # ---------------------------
+        # =====================================================
+
+        match_label = QLabel("Match")
+        match_label.setStyleSheet("color: #888; font-size: 14px;")
+        right.addWidget(match_label)
+
         self.combo = QComboBox()
 
-        if self.matches:
-            for m in self.matches:
-                t = m["title"]
-                y = m.get("release_date", "")[:4]
-                r = m.get("vote_average", 0)
-                self.combo.addItem(f"{t} ({y}) {r:.1f}", m)
-        else:
-            self.combo.addItem("No match", None)
+        # Populate dropdown with TMDB results
+        for m in self.matches:
+            year = (m.get("release_date") or "")[:4] or "?"
+            self.combo.addItem(f"{m['title']} ({year})", m)
 
-        self.combo.currentIndexChanged.connect(self.update_row)
+        # Update preview whenever selection changes
+        self.combo.currentIndexChanged.connect(self.update_preview)
+        self.combo.setStyleSheet(
+            "color: #000; font-weight: 500;"
+        )
 
-        # ---------------------------
-        # NEW NAME PREVIEW FIELD
-        # ---------------------------
-        self.preview = QLabel("")
-        self.preview.setWordWrap(True)
-        self.preview.setStyleSheet("color: #ccc; font-weight: 500;")
+        right.addWidget(self.combo)
 
-        # Add all fields into structured grid
-        field_grid.addWidget(make_row("Original File", self.file_label))
-        field_grid.addWidget(make_row("Match", self.combo))
-        field_grid.addWidget(make_row("New Name", self.preview))
+        # Add right column to main layout
+        layout.addLayout(right)
 
-        # Attach field grid to right panel
-        right.addLayout(field_grid)
-        right.addStretch()
+        # Initialize preview on creation
+        self.update_preview()
 
-        # Combine left (poster) + right (fields)
-        main.addLayout(right)
+    # =========================================================
+    # CALLBACK HANDLER FOR THEMOVIEDB SEARCH THREADS
+    # =========================================================
+    def on_matches_ready(self, worker, results):
+        """
+        Receives TMDB results from background thread
+        and updates UI safely in main thread.
+        """
 
-        self.setLayout(main)
+        self.matches = results
 
-        # Initial render of preview + poster
-        self.update_row()
+        self.combo.blockSignals(True)
+        self.combo.clear()
 
-    # ---------------------------
-    # UPDATE ROW DISPLAY
-    # ---------------------------
-    # Updates preview name and loads poster image
-    def update_row(self):
+        for m in results:
+            year = (m.get("release_date") or "")[:4] or "?"
+            self.combo.addItem(f"{m['title']} ({year})", m)
+
+        self.combo.blockSignals(False)
+
+        self.update_preview()
+
+    # =========================================================
+    # UPDATE PREVIEW + POSTER
+    # =========================================================
+
+    def update_preview(self):
+        """
+        Updates:
+        - filename preview
+        - poster image
+        based on selected TMDB match
+        """
+
         movie = self.combo.currentData()
-
         if not movie:
-            self.preview.setText("No valid match")
+            self.preview.setText("No match")
             return
 
-        # Update filename preview
-        self.preview.setText(format_name(movie, self.ext))
+        # Build Plex-style filename preview
+        title = movie.get("title", "Unknown")
+        year = (movie.get("release_date") or "")[:4] or "Unknown"
+        self.preview.setText(f"{title} ({year}){self.ext}")
 
-        # Load poster image from TMDB
+        # Load poster image if available
         if movie.get("poster_path"):
-            try:
-                url = IMAGE_BASE + movie["poster_path"]
-                data = requests.get(url).content
+            url = IMAGE_BASE + movie["poster_path"]
 
-                pixmap = QPixmap()
-                pixmap.loadFromData(data)
+            def set_poster(data):
+                pix = QPixmap()
+                pix.loadFromData(data)
+                self.poster.setPixmap(pix.scaledToWidth(120))
 
-                self.poster.setPixmap(
-                    pixmap.scaled(
-                        120,
-                        180,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation
-                    )
-                )
-            except:
-                pass
+            worker = PosterWorker(url, set_poster)
+            thread_pool.start(worker)
 
-    # ---------------------------
+    # =========================================================
     # RENAME FILE ON DISK
-    # ---------------------------
+    # =========================================================
+
     def rename(self):
+        """
+        Renames file using selected TMDB metadata
+        into Plex-compatible format.
+        """
+
         movie = self.combo.currentData()
         if not movie:
             return
 
-        # Generate Plex-style filename
-        new_name = format_name(movie, self.ext)
+        title = movie.get("title", "Unknown")
+        year = (movie.get("release_date") or "")[:4] or "Unknown"
+
+        new_name = f"{title} ({year}){self.ext}"
         new_path = os.path.join(os.path.dirname(self.filepath), new_name)
 
-        try:
-            os.rename(self.filepath, new_path)
-            print(f"Renamed -> {new_name}")
-        except Exception as e:
-            print(f"Error: {e}")
-
-    # ---------------------------
-    # REMOVE ROW FROM UI
-    # ---------------------------
-    def handle_remove(self):
-        if self.on_remove:
-            self.on_remove(self)
+        os.rename(self.filepath, new_path)
 
 
-# ---------------------------
+# =========================================================
 # MAIN APPLICATION WINDOW
-# ---------------------------
+# =========================================================
+
 class MovieRenamer(QWidget):
     def __init__(self):
         super().__init__()
 
-        # Window configuration
-        self.setWindowTitle("Plex Movie Renamer")
-        self.resize(1000, 700)
-
-        # Store active rows
+        # Track all active movie rows
         self.rows = []
 
-        # ---------------------------
-        # MAIN LAYOUT
-        # ---------------------------
-        layout = QVBoxLayout()
+        self.setWindowTitle("Movie Renamer")
+        self.resize(900, 600)
 
-        # Header label
-        self.label = QLabel("Drag and drop movie files anywhere")
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.label.setStyleSheet("color: #aaa; font-size: 16px;")
-        layout.addWidget(self.label)
+        # Main vertical layout for entire window
+        layout = QVBoxLayout(self)
 
-        # ---------------------------
-        # SCROLLABLE LIST AREA
-        # ---------------------------
+        # Scrollable container for movie rows
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
 
         self.container = QWidget()
-        self.list_layout = QVBoxLayout()
-        self.list_layout.setSpacing(10)
+        self.list_layout = QVBoxLayout(self.container)
+        self.list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        self.container.setLayout(self.list_layout)
         self.scroll.setWidget(self.container)
-
         layout.addWidget(self.scroll)
 
-        # ---------------------------
-        # CONFIRM BUTTON
-        # ---------------------------
-        self.button = QPushButton("Confirm Rename")
-        self.button.setStyleSheet("""
-            QPushButton {
-                background-color: #0078d7;
-                padding: 10px;
-                border-radius: 6px;
-                font-weight: bold;
-            }
-        """)
-        self.button.clicked.connect(self.rename_all)
+        # Button to rename all queued files
+        btn = QPushButton("Rename All")
+        btn.clicked.connect(self.rename_all)
+        layout.addWidget(btn)
 
-        layout.addWidget(self.button)
-
-        self.setLayout(layout)
-
-        # Enable drag and drop
+        # Enable drag-and-drop file support
         self.setAcceptDrops(True)
 
-    # ---------------------------
-    # DRAG AND DROP HANDLING
-    # ---------------------------
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+    # =========================================================
+    # DRAG & DROP HANDLING
+    # =========================================================
 
-    def dropEvent(self, event):
-        for url in event.mimeData().urls():
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.accept()
+
+    def dropEvent(self, e):
+        # Convert dropped URLs into file paths
+        for url in e.mimeData().urls():
             path = url.toLocalFile()
             if os.path.isfile(path):
-                self.add_row(path)
+                self.add_file(path)
 
-    # ---------------------------
-    # ADD NEW MOVIE ROW
-    # ---------------------------
-    def add_row(self, filepath):
-        row = MovieRow(filepath)
-        row.on_remove = self.remove_row
+    # =========================================================
+    # ROW MANAGEMENT
+    # =========================================================
+
+    def add_file(self, path):
+        row = MovieRow(path, self.remove_row)
         self.rows.append(row)
         self.list_layout.addWidget(row)
 
-    # ---------------------------
-    # REMOVE MOVIE ROW
-    # ---------------------------
     def remove_row(self, row):
-        self.list_layout.removeWidget(row)
         self.rows.remove(row)
         row.setParent(None)
         row.deleteLater()
 
-    # ---------------------------
-    # BATCH RENAME ALL FILES
-    # ---------------------------
+    # =========================================================
+    # BATCH RENAME ACTION
+    # =========================================================
+
     def rename_all(self):
-        confirm = QMessageBox.question(
-            self,
-            "Confirm Rename",
-            "Rename all files?"
-        )
-
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-
-        for row in self.rows:
-            row.rename()
-
-        QMessageBox.information(self, "Done", "Renaming complete!")
+        for r in self.rows:
+            r.rename()
 
 
-# ---------------------------
+# =========================================================
 # APPLICATION ENTRY POINT
-# ---------------------------
+# =========================================================
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-
-    apply_dark_theme(app)
-
     window = MovieRenamer()
     window.show()
-
     sys.exit(app.exec())
